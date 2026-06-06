@@ -12,10 +12,14 @@ import type {
 	Api,
 	AssistantMessage,
 	CacheRetention,
+	Citation,
 	Context,
 	ImageContent,
 	Message,
 	Model,
+	NativeWebSearchOptions,
+	ServerToolName,
+	ServerToolUseContent,
 	SimpleStreamOptions,
 	StopReason,
 	StreamFunction,
@@ -25,6 +29,7 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
+	WebSearchResultRef,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
@@ -522,8 +527,22 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
+			type Block = (
+				| ThinkingContent
+				| TextContent
+				| (ToolCall & { partialJson: string })
+				| (ServerToolUseContent & { partialJson?: string })
+			) & { index: number };
 			const blocks = output.content as Block[];
+			/**
+			 * Anthropic emits `web_search_tool_result` as its own top-level content
+			 * block (separate index, separate start/stop pair). We don't surface it as
+			 * a standalone block to callers — instead we fold its results into the
+			 * matching `serverToolUse` content block and emit `server_tool_use_end`.
+			 * Track the result block's index so subsequent delta/stop events for it
+			 * don't accidentally land on a real block.
+			 */
+			const webSearchResultIndices = new Set<number>();
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				if (event.type === "message_start") {
@@ -579,6 +598,67 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						};
 						output.content.push(block);
 						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+					} else if (event.content_block.type === "server_tool_use") {
+						// Anthropic-hosted tool call (today: web_search / web_fetch / etc).
+						// Only `web_search` is surfaced through the unified type for now;
+						// any other name is still tracked so the input stream doesn't crash,
+						// but we coerce the name into the unified union.
+						const cb = event.content_block;
+						const input = (cb.input as Record<string, unknown> | undefined) ?? undefined;
+						const initialQuery = typeof input?.query === "string" ? input.query : undefined;
+						const block: Block = {
+							type: "serverToolUse",
+							id: cb.id,
+							name: cb.name === "web_search" ? "web_search" : (cb.name as ServerToolName),
+							status: "in_progress",
+							queries: initialQuery ? [initialQuery] : undefined,
+							// Always start the streaming scratch buffer empty. Anthropic
+							// emits the full input via `input_json_delta` events even when
+							// the initial `content_block_start` carries a placeholder `{}`,
+							// so seeding from `cb.input` would corrupt the accumulated JSON.
+							partialJson: "",
+							index: event.index,
+						};
+						output.content.push(block);
+						stream.push({
+							type: "server_tool_use_start",
+							contentIndex: output.content.length - 1,
+							partial: output,
+						});
+					} else if (event.content_block.type === "web_search_tool_result") {
+						// Pair the result block with the matching server_tool_use we already
+						// emitted. The result block itself is *not* pushed onto
+						// `output.content` — its data lives on the parent ServerToolUseContent.
+						webSearchResultIndices.add(event.index);
+						const cb = event.content_block;
+						const targetIndex = output.content.findIndex(
+							(c) => c.type === "serverToolUse" && c.id === cb.tool_use_id,
+						);
+						const target = targetIndex >= 0 ? (output.content[targetIndex] as ServerToolUseContent) : undefined;
+						if (target) {
+							const content = cb.content;
+							if (Array.isArray(content)) {
+								target.results = content.map(
+									(r): WebSearchResultRef => ({
+										url: r.url,
+										title: r.title,
+										pageAge: r.page_age ?? undefined,
+										encryptedContent: r.encrypted_content,
+									}),
+								);
+								target.status = "completed";
+							} else if (content && typeof content === "object" && "error_code" in content) {
+								target.status = "error";
+								target.errorCode = content.error_code;
+							}
+							target.signature = JSON.stringify(cb);
+							stream.push({
+								type: "server_tool_use_end",
+								contentIndex: targetIndex,
+								serverToolUse: target,
+								partial: output,
+							});
+						}
 					}
 				} else if (event.type === "content_block_delta") {
 					if (event.delta.type === "text_delta") {
@@ -617,6 +697,42 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 								delta: event.delta.partial_json,
 								partial: output,
 							});
+						} else if (block && block.type === "serverToolUse") {
+							block.partialJson = (block.partialJson ?? "") + event.delta.partial_json;
+							const parsed = parseStreamingJson(block.partialJson) as { query?: unknown } | undefined;
+							if (parsed && typeof parsed.query === "string") {
+								block.queries = [parsed.query];
+							}
+							stream.push({
+								type: "server_tool_use_delta",
+								contentIndex: index,
+								partial: output,
+							});
+						}
+					} else if (event.delta.type === "citations_delta") {
+						// Surface `web_search_result_location` citations onto the parent text
+						// block. Other citation kinds (page/char/search_result/...) aren't
+						// modeled yet — drop them silently.
+						const cit = event.delta.citation;
+						if (cit.type === "web_search_result_location") {
+							const index = blocks.findIndex((b) => b.index === event.index);
+							const block = blocks[index];
+							if (block && block.type === "text") {
+								const citation: Citation = {
+									url: cit.url,
+									title: cit.title ?? undefined,
+									citedText: cit.cited_text,
+									encryptedIndex: cit.encrypted_index,
+								};
+								block.citations = block.citations || [];
+								block.citations.push(citation);
+								stream.push({
+									type: "citation_added",
+									contentIndex: index,
+									citation,
+									partial: output,
+								});
+							}
 						}
 					} else if (event.delta.type === "signature_delta") {
 						const index = blocks.findIndex((b) => b.index === event.index);
@@ -627,6 +743,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						}
 					}
 				} else if (event.type === "content_block_stop") {
+					if (webSearchResultIndices.delete(event.index)) {
+						// `web_search_tool_result` doesn't have its own content block; nothing
+						// to finalize. server_tool_use_end was already emitted on _start.
+						continue;
+					}
 					const index = blocks.findIndex((b) => b.index === event.index);
 					const block = blocks[index];
 					if (block) {
@@ -656,6 +777,13 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 								toolCall: block,
 								partial: output,
 							});
+						} else if (block.type === "serverToolUse") {
+							// server_tool_use input is complete. Final queries already set via
+							// the input_json_delta handler (or the initial `input` payload).
+							// `server_tool_use_end` is emitted when the matching
+							// web_search_tool_result block arrives; this stop event just
+							// finalizes the scratch buffer.
+							delete (block as { partialJson?: string }).partialJson;
 						}
 					}
 				} else if (event.type === "message_delta") {
@@ -937,13 +1065,23 @@ function buildParams(
 		params.temperature = options.temperature;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertTools(
-			context.tools,
-			isOAuthToken,
-			compat.supportsEagerToolInputStreaming,
-			compat.supportsCacheControlOnTools ? cacheControl : undefined,
+	const tools: Anthropic.Messages.ToolUnion[] = [];
+	if (context.tools?.length) {
+		tools.push(
+			...convertTools(
+				context.tools,
+				isOAuthToken,
+				compat.supportsEagerToolInputStreaming,
+				compat.supportsCacheControlOnTools ? cacheControl : undefined,
+			),
 		);
+	}
+	const nativeWebSearchTool = convertAnthropicWebSearchTool(options?.nativeTools?.webSearch);
+	if (nativeWebSearchTool) {
+		tools.push(nativeWebSearchTool);
+	}
+	if (tools.length > 0) {
+		params.tools = tools;
 	}
 
 	// Configure thinking mode: adaptive, budget-based, or explicitly disabled.
@@ -1222,4 +1360,40 @@ function mapStopReason(reason: Anthropic.Messages.StopReason | string): StopReas
 			// Handle unknown stop reasons gracefully (API may add new values)
 			throw new Error(`Unhandled stop reason: ${reason}`);
 	}
+}
+
+function normalizeNativeWebSearch(
+	webSearch: boolean | NativeWebSearchOptions | undefined,
+): NativeWebSearchOptions | undefined {
+	if (!webSearch) return undefined;
+	if (webSearch === true) return {};
+	return webSearch;
+}
+
+function convertAnthropicWebSearchTool(
+	webSearch: boolean | NativeWebSearchOptions | undefined,
+): Anthropic.Messages.WebSearchTool20250305 | undefined {
+	const config = normalizeNativeWebSearch(webSearch);
+	if (!config) return undefined;
+
+	if (config.allowedDomains?.length && config.blockedDomains?.length) {
+		throw new Error("Anthropic web search supports allowedDomains or blockedDomains, not both.");
+	}
+
+	return {
+		name: "web_search",
+		type: "web_search_20250305",
+		allowed_domains: config.allowedDomains,
+		blocked_domains: config.blockedDomains,
+		max_uses: config.maxUses,
+		user_location: config.userLocation
+			? {
+					type: config.userLocation.type ?? "approximate",
+					city: config.userLocation.city,
+					country: config.userLocation.country,
+					region: config.userLocation.region,
+					timezone: config.userLocation.timezone,
+				}
+			: undefined,
+	};
 }

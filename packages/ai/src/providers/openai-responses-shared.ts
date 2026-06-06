@@ -4,11 +4,13 @@ import type {
 	ResponseCreateParamsStreaming,
 	ResponseFunctionCallOutputItemList,
 	ResponseFunctionToolCall,
+	ResponseFunctionWebSearch,
 	ResponseInput,
 	ResponseInputContent,
 	ResponseInputImage,
 	ResponseInputText,
 	ResponseOutputMessage,
+	ResponseOutputText,
 	ResponseReasoningItem,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
@@ -16,9 +18,12 @@ import { calculateCost } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
+	Citation,
 	Context,
 	ImageContent,
 	Model,
+	NativeWebSearchOptions,
+	ServerToolUseContent,
 	StopReason,
 	TextContent,
 	TextSignatureV1,
@@ -26,6 +31,7 @@ import type {
 	Tool,
 	ToolCall,
 	Usage,
+	WebSearchResultRef,
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
@@ -81,6 +87,7 @@ export interface ConvertResponsesMessagesOptions {
 
 export interface ConvertResponsesToolsOptions {
 	strict?: boolean | null;
+	nativeWebSearch?: boolean | NativeWebSearchOptions;
 }
 
 // =============================================================================
@@ -269,20 +276,87 @@ export function convertResponsesMessages<TApi extends Api>(
 // Tool conversion
 // =============================================================================
 
+function normalizeNativeWebSearch(
+	webSearch: boolean | NativeWebSearchOptions | undefined,
+): NativeWebSearchOptions | undefined {
+	if (!webSearch) return undefined;
+	if (webSearch === true) return {};
+	return webSearch;
+}
+
+function convertOpenAIWebSearchTool(webSearch: boolean | NativeWebSearchOptions | undefined): OpenAITool | undefined {
+	const config = normalizeNativeWebSearch(webSearch);
+	if (!config) return undefined;
+
+	if (config.allowedDomains?.length && config.blockedDomains?.length) {
+		throw new Error("OpenAI web search supports allowedDomains or blockedDomains, not both.");
+	}
+	if (config.blockedDomains?.length) {
+		throw new Error("OpenAI web search does not support blockedDomains. Use allowedDomains instead.");
+	}
+
+	const tool: OpenAITool = {
+		type: "web_search",
+	};
+
+	if (config.allowedDomains?.length) {
+		tool.filters = {
+			allowed_domains: config.allowedDomains,
+		};
+	}
+
+	if (config.searchContextSize) {
+		tool.search_context_size = config.searchContextSize;
+	}
+
+	if (config.userLocation) {
+		tool.user_location = {
+			type: config.userLocation.type ?? "approximate",
+			city: config.userLocation.city,
+			country: config.userLocation.country,
+			region: config.userLocation.region,
+			timezone: config.userLocation.timezone,
+		};
+	}
+
+	return tool;
+}
+
 export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
 	const strict = options?.strict === undefined ? false : options.strict;
-	return tools.map((tool) => ({
-		type: "function",
-		name: tool.name,
-		description: tool.description,
-		parameters: tool.parameters as any, // TypeBox already generates JSON Schema
-		strict,
-	}));
+
+	const output: OpenAITool[] = [];
+
+	for (const tool of tools ?? []) {
+		output.push({
+			type: "function",
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters as any, // TypeBox already generates JSON Schema
+			strict,
+		});
+	}
+
+	const webSearchTool = convertOpenAIWebSearchTool(options?.nativeWebSearch);
+	if (webSearchTool) {
+		output.push(webSearchTool);
+	}
+
+	return output;
 }
 
 // =============================================================================
 // Stream processing
 // =============================================================================
+
+type ResponseOutputTextAnnotation = ResponseOutputText["annotations"][number];
+
+function normalizeWebSearchStatus(status: ResponseFunctionWebSearch["status"]): ServerToolUseContent["status"] {
+	if (status === "in_progress") return "in_progress";
+	if (status === "searching") return "searching";
+	if (status === "completed") return "completed";
+	return "error";
+}
 
 export async function processResponsesStream<TApi extends Api>(
 	openaiStream: AsyncIterable<ResponseStreamEvent>,
@@ -291,10 +365,24 @@ export async function processResponsesStream<TApi extends Api>(
 	model: Model<TApi>,
 	options?: OpenAIResponsesStreamOptions,
 ): Promise<void> {
-	let currentItem: ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | null = null;
-	let currentBlock: ThinkingContent | TextContent | (ToolCall & { partialJson: string }) | null = null;
+	let currentItem:
+		| ResponseReasoningItem
+		| ResponseOutputMessage
+		| ResponseFunctionToolCall
+		| ResponseFunctionWebSearch
+		| null = null;
+	let currentBlock:
+		| ThinkingContent
+		| TextContent
+		| (ToolCall & { partialJson: string })
+		| ServerToolUseContent
+		| null = null;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
+	// item.id → index in output.content. Lets us route per-item events
+	// (annotations, web_search_call status) back to the right block when the
+	// stream interleaves multiple output items.
+	const itemIdToContentIndex = new Map<string, number>();
 
 	for await (const event of openaiStream) {
 		if (event.type === "response.created") {
@@ -305,11 +393,13 @@ export async function processResponsesStream<TApi extends Api>(
 				currentItem = item;
 				currentBlock = { type: "thinking", thinking: "" };
 				output.content.push(currentBlock);
+				itemIdToContentIndex.set(item.id, blockIndex());
 				stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
 			} else if (item.type === "message") {
 				currentItem = item;
 				currentBlock = { type: "text", text: "" };
 				output.content.push(currentBlock);
+				itemIdToContentIndex.set(item.id, blockIndex());
 				stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
 			} else if (item.type === "function_call") {
 				currentItem = item;
@@ -321,7 +411,66 @@ export async function processResponsesStream<TApi extends Api>(
 					partialJson: item.arguments || "",
 				};
 				output.content.push(currentBlock);
+				if (item.id) {
+					itemIdToContentIndex.set(item.id, blockIndex());
+				}
 				stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+			} else if (item.type === "web_search_call") {
+				currentItem = item;
+				const block: ServerToolUseContent = {
+					type: "serverToolUse",
+					id: item.id,
+					name: "web_search",
+					status: normalizeWebSearchStatus(item.status),
+				};
+				currentBlock = block;
+				output.content.push(block);
+				itemIdToContentIndex.set(item.id, blockIndex());
+				stream.push({ type: "server_tool_use_start", contentIndex: blockIndex(), partial: output });
+			}
+		} else if (
+			event.type === "response.web_search_call.in_progress" ||
+			event.type === "response.web_search_call.searching" ||
+			event.type === "response.web_search_call.completed"
+		) {
+			const targetIndex = itemIdToContentIndex.get(event.item_id);
+			if (targetIndex !== undefined) {
+				const block = output.content[targetIndex];
+				if (block?.type === "serverToolUse") {
+					if (event.type === "response.web_search_call.in_progress") {
+						block.status = "in_progress";
+					} else if (event.type === "response.web_search_call.searching") {
+						block.status = "searching";
+					} else {
+						block.status = "completed";
+					}
+					stream.push({ type: "server_tool_use_delta", contentIndex: targetIndex, partial: output });
+				}
+			}
+		} else if (event.type === "response.output_text.annotation.added") {
+			const annotation = event.annotation as ResponseOutputTextAnnotation | undefined;
+			if (annotation?.type === "url_citation") {
+				const targetIndex = itemIdToContentIndex.get(event.item_id);
+				const target = targetIndex !== undefined ? output.content[targetIndex] : undefined;
+				if (target?.type === "text") {
+					const citation: Citation = {
+						url: annotation.url,
+						title: annotation.title,
+						startIndex: annotation.start_index,
+						endIndex: annotation.end_index,
+					};
+					target.citations = target.citations || [];
+					target.citations.push(citation);
+					// Mirror onto the in-flight currentItem so output_item.done sees it later.
+					if (currentItem?.type === "message" && currentItem.id === event.item_id) {
+						const part = currentItem.content?.[event.content_index];
+						if (part?.type === "output_text") {
+							part.annotations = part.annotations || [];
+							part.annotations.push(annotation);
+						}
+					}
+					stream.push({ type: "citation_added", contentIndex: targetIndex!, citation, partial: output });
+				}
 			}
 		} else if (event.type === "response.reasoning_summary_part.added") {
 			if (currentItem && currentItem.type === "reasoning") {
@@ -457,6 +606,31 @@ export async function processResponsesStream<TApi extends Api>(
 			} else if (item.type === "message" && currentBlock?.type === "text") {
 				currentBlock.text = item.content.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("");
 				currentBlock.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
+				// Fold any url_citation annotations attached to the final message into the
+				// text block, deduplicating against citations that arrived via streaming
+				// `output_text.annotation.added` events.
+				for (const part of item.content) {
+					if (part.type !== "output_text" || !part.annotations) continue;
+					for (const annotation of part.annotations as ResponseOutputTextAnnotation[]) {
+						if (annotation.type !== "url_citation") continue;
+						if (!currentBlock.citations) currentBlock.citations = [];
+						const dedup = currentBlock.citations;
+						const alreadyPresent = dedup.some(
+							(c) =>
+								c.url === annotation.url &&
+								c.startIndex === annotation.start_index &&
+								c.endIndex === annotation.end_index,
+						);
+						if (!alreadyPresent) {
+							dedup.push({
+								url: annotation.url,
+								title: annotation.title,
+								startIndex: annotation.start_index,
+								endIndex: annotation.end_index,
+							});
+						}
+					}
+				}
 				stream.push({
 					type: "text_end",
 					contentIndex: blockIndex(),
@@ -488,6 +662,45 @@ export async function processResponsesStream<TApi extends Api>(
 
 				currentBlock = null;
 				stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
+			} else if (item.type === "web_search_call") {
+				const targetIndex = itemIdToContentIndex.get(item.id);
+				const target = targetIndex !== undefined ? output.content[targetIndex] : undefined;
+				if (target?.type === "serverToolUse") {
+					target.status = normalizeWebSearchStatus(item.status);
+					const action = item.action;
+					if (action?.type === "search") {
+						const queries =
+							action.queries && action.queries.length > 0
+								? action.queries
+								: action.query
+									? [action.query]
+									: undefined;
+						target.queries = queries;
+						target.action = {
+							type: "search",
+							query: action.query,
+							queries: action.queries,
+							sources: action.sources?.map((s) => ({ url: s.url })),
+						};
+						if (action.sources && action.sources.length > 0) {
+							target.results = action.sources.map((s): WebSearchResultRef => ({ url: s.url, title: "" }));
+						}
+					} else if (action?.type === "open_page") {
+						target.action = { type: "open_page", url: action.url ?? "" };
+					} else if (action?.type === "find_in_page") {
+						target.action = { type: "find_in_page", url: action.url, pattern: action.pattern };
+					}
+					target.signature = JSON.stringify(item);
+					stream.push({
+						type: "server_tool_use_end",
+						contentIndex: targetIndex!,
+						serverToolUse: target,
+						partial: output,
+					});
+				}
+				if (currentBlock?.type === "serverToolUse" && currentBlock === target) {
+					currentBlock = null;
+				}
 			}
 		} else if (event.type === "response.completed") {
 			const response = event.response;

@@ -525,6 +525,11 @@ function toChatMessages(messages: Message[], supportsImages: boolean): ChatCompl
 					}
 					continue;
 				}
+				if (block.type === "serverToolUse") {
+					// Mistral has no concept of provider-hosted tool calls — drop them
+					// when replaying assistant messages back to the API.
+					continue;
+				}
 				toolCalls.push({
 					id: block.id,
 					type: "function",
