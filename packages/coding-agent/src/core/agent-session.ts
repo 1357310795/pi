@@ -30,6 +30,7 @@ import type {
 	AuthResult,
 	ImageContent,
 	Model,
+	NativeToolsOptions,
 	ProviderHeaders,
 	TextContent,
 	Usage,
@@ -216,6 +217,7 @@ export interface AgentSessionConfig {
 	allowedToolNames?: string[];
 	/** Optional denylist of tool names. When provided, these tool names are not exposed. */
 	excludedToolNames?: string[];
+	nativeTools?: NativeToolsOptions;
 	/**
 	 * Override base tools (useful for custom runtimes).
 	 *

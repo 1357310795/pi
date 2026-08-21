@@ -269,6 +269,8 @@ function buildParams(
 		compat.supportsOpenAIGrammarTools,
 	),
 ) {
+	type ResponseInclude = NonNullable<ResponseCreateParamsStreaming["include"]>[number];
+	const include = new Set<ResponseInclude>();
 	const deferredToolsMode = compat.supportsAdditionalTools
 		? "additional-tools"
 		: compat.supportsToolSearch
@@ -309,6 +311,16 @@ function buildParams(
 		params.service_tier = options.serviceTier;
 	}
 
+	const convertedTools = convertResponsesTools(context.tools ?? [], {
+		nativeWebSearch: options?.nativeTools?.webSearch,
+	});
+	if (convertedTools.length > 0) {
+		params.tools = convertedTools;
+	}
+	if (options?.nativeTools?.webSearch) {
+		include.add("web_search_call.action.sources");
+		include.add("web_search_call.results");
+	}
 	if (toolPlacement.immediate.length > 0) {
 		params.tools = convertResponsesTools(toolPlacement.immediate, {
 			supportsStrictMode: compat.supportsStrictMode,
@@ -329,7 +341,7 @@ function buildParams(
 				effort: effort as NonNullable<typeof params.reasoning>["effort"],
 				summary: options?.reasoningSummary || "auto",
 			};
-			params.include = ["reasoning.encrypted_content"];
+			include.add("reasoning.encrypted_content");
 		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
 			params.reasoning = {
 				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
@@ -341,6 +353,10 @@ function buildParams(
 	// Last so custom keys override the named request fields.
 	if (options?.samplingParams) {
 		Object.assign(params, options.samplingParams);
+	}
+
+	if (include.size > 0) {
+		params.include = [...include];
 	}
 
 	return params;

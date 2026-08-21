@@ -458,7 +458,7 @@ function isReservedHeader(key: string): boolean {
  * all other caller headers override any existing same-named header on the request.
  */
 function addCustomHeadersMiddleware(client: BedrockRuntimeClient, headers: Record<string, string>): void {
-	const middleware: BuildMiddleware<object, MetadataBearer> = (next) => async (args) => {
+	const middleware: BuildMiddleware<object, MetadataBearer> = (next: any) => async (args: any) => {
 		const request = args.request;
 		if (request && typeof request === "object" && "headers" in request) {
 			const requestHeaders = (request as { headers: Record<string, string> }).headers;
@@ -496,7 +496,7 @@ function addResponseHeadersMiddleware(
 	model: Model<"bedrock-converse-stream">,
 	onObserved: () => void,
 ): void {
-	const middleware: DeserializeMiddleware<object, MetadataBearer> = (next) => async (args) => {
+	const middleware: DeserializeMiddleware<object, MetadataBearer> = (next: any) => async (args: any) => {
 		const result = await next(args);
 		const providerResponse = toProviderResponse(result.response);
 		if (providerResponse) {

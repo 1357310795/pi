@@ -109,6 +109,25 @@ export type CacheRetention = "none" | "short" | "long";
 
 export type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
 
+export interface NativeToolUserLocation {
+	type?: "approximate";
+	city?: string;
+	country?: string;
+	region?: string;
+	timezone?: string;
+}
+
+export interface NativeWebSearchOptions {
+	allowedDomains?: string[];
+	blockedDomains?: string[];
+	maxUses?: number;
+	searchContextSize?: "low" | "medium" | "high";
+	userLocation?: NativeToolUserLocation;
+}
+
+export interface NativeToolsOptions {
+	webSearch?: boolean | NativeWebSearchOptions;
+}
 /** Provider-scoped environment overrides. Values take precedence over process.env. */
 export type ProviderEnv = Record<string, string>;
 export type ProviderHeaders = Record<string, string | null>;
@@ -220,6 +239,11 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.
 	 */
 	metadata?: Record<string, unknown>;
+	/**
+	 * Provider-native built-in tools (for example, hosted web search).
+	 * Providers ignore tools they don't support.
+	 */
+	nativeTools?: NativeToolsOptions;
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
@@ -351,6 +375,8 @@ export interface TextContent {
 	type: "text";
 	text: string;
 	textSignature?: string; // e.g., for OpenAI responses, message metadata (legacy id string or TextSignatureV1 JSON)
+	/** Citations attached to this text block (e.g. from native web search). */
+	citations?: Citation[];
 }
 
 export interface ThinkingContent {
@@ -377,6 +403,76 @@ export interface ToolCall {
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
 	/** OpenAI Responses namespace for calls to dynamically loaded or namespaced tools. */
 	namespace?: string;
+}
+
+/**
+ * Provider-hosted ("server-side") tool invocation surfaced in the assistant
+ * message stream. Today only `web_search` is modeled, but the shape is meant
+ * to grow as more native tools (web_fetch, code_execution, ...) are added.
+ *
+ * Lifecycle on the stream:
+ *   server_tool_use_start  (when the model decides to call the tool)
+ *   server_tool_use_delta* (queries/status updates while results stream in)
+ *   server_tool_use_end    (when the tool call is finalized, success or error)
+ *
+ * The content block is kept in `AssistantMessage.content` so the UI can render
+ * a "the model searched for X and found N results" affordance without losing
+ * any data when the message is persisted and replayed.
+ */
+export interface ServerToolUseContent {
+	type: "serverToolUse";
+	/** Provider-side identifier for the call. OpenAI: `web_search_call` item id; Anthropic: `server_tool_use` block id. */
+	id: string;
+	name: ServerToolName;
+	status: ServerToolStatus;
+	/** Search queries issued by the model. OpenAI may issue several in one call. */
+	queries?: string[];
+	/** OpenAI Responses exposes richer per-call actions (search / open_page / find_in_page). */
+	action?: ServerToolAction;
+	/** Search hits returned by the provider, when surfaced inline (Anthropic) or via the `include` list (OpenAI). */
+	results?: WebSearchResultRef[];
+	/** When the provider reports the call failed. */
+	errorCode?: string;
+	/** Provider-specific opaque payload (e.g. raw item JSON) used to replay this block in later turns. */
+	signature?: string;
+}
+
+export type ServerToolName = "web_search";
+
+export type ServerToolStatus = "in_progress" | "searching" | "completed" | "error";
+
+export type ServerToolAction =
+	| { type: "search"; query?: string; queries?: string[]; sources?: { url: string }[] }
+	| { type: "open_page"; url: string }
+	| { type: "find_in_page"; url: string; pattern: string };
+
+export interface WebSearchResultRef {
+	url: string;
+	title: string;
+	/** Provider-supplied page age string (Anthropic: `page_age`). */
+	pageAge?: string;
+	/** Anthropic: opaque blob needed to reference the result in later turns. */
+	encryptedContent?: string;
+	/** Anthropic: opaque index used by citation `web_search_result_location`. */
+	encryptedIndex?: string;
+}
+
+/**
+ * A citation produced by a native search tool, anchored to a slice of a text block.
+ * For OpenAI Responses, indices map to `start_index`/`end_index` on `url_citation`
+ * annotations. For Anthropic, the indices are not provided directly; the citation
+ * carries `citedText` and `encryptedIndex` instead.
+ */
+export interface Citation {
+	url: string;
+	title?: string;
+	startIndex?: number;
+	endIndex?: number;
+	citedText?: string;
+	/** Anthropic: opaque pointer back to the underlying web_search_result. */
+	encryptedIndex?: string;
+	/** Optional link back to the originating `ServerToolUseContent.id`. */
+	toolUseId?: string;
 }
 
 export interface Usage {
@@ -426,7 +522,7 @@ export interface UserMessage {
 
 export interface AssistantMessage {
 	role: "assistant";
-	content: (TextContent | ThinkingContent | ToolCall)[];
+	content: (TextContent | ThinkingContent | ToolCall | ServerToolUseContent)[];
 	api: Api;
 	provider: ProviderId;
 	model: string;
@@ -543,6 +639,21 @@ export type AssistantMessageEvent =
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
+	| { type: "server_tool_use_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "server_tool_use_delta"; contentIndex: number; partial: AssistantMessage }
+	| {
+			type: "server_tool_use_end";
+			contentIndex: number;
+			serverToolUse: ServerToolUseContent;
+			partial: AssistantMessage;
+	  }
+	| {
+			type: "citation_added";
+			contentIndex: number;
+			citation: Citation;
+			partial: AssistantMessage;
+	  }
+	| { type: "done"; reason: Extract<StopReason, "stop" | "length" | "toolUse">; message: AssistantMessage }
 	| {
 			type: "done";
 			reason: Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">;

@@ -47,8 +47,8 @@
 		"node": ">=22.19.0"
 	},
 	"dependencies": {
-		"@earendil-works/pi-ai": "^0.84.2",
-		"@earendil-works/pi-protocol": "^0.84.2"
+		"@earendil-works/pi-ai": "workspace:*",
+		"@earendil-works/pi-protocol": "workspace:*"
 	},
 	"devDependencies": {
 		"shx": "0.4.0",
