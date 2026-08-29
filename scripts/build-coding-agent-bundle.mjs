@@ -52,8 +52,13 @@ export function createJiti(...args) {
 const httpsProxyAgentNamedExportPlugin = {
 	name: "https-proxy-agent-named-export",
 	setup(build) {
+		// Resolve the re-export from the dynamic importer's directory so the
+		// package is found in every install layout (pnpm keeps it in the
+		// importer's own node_modules, npm hoists it to the workspace root).
+		const resolveDirs = new Map();
 		build.onResolve({ filter: /^https-proxy-agent$/ }, (args) => {
 			if (args.kind !== "dynamic-import") return undefined;
+			resolveDirs.set(args.path, args.resolveDir);
 			return {
 				namespace: "https-proxy-agent-named-export",
 				path: args.path,
@@ -64,10 +69,10 @@ const httpsProxyAgentNamedExportPlugin = {
 				filter: /^https-proxy-agent$/,
 				namespace: "https-proxy-agent-named-export",
 			},
-			() => ({
+			(args) => ({
 				contents: 'export { HttpsProxyAgent } from "https-proxy-agent";',
 				loader: "js",
-				resolveDir: repoRoot,
+				resolveDir: resolveDirs.get(args.path) ?? repoRoot,
 			}),
 		);
 	},

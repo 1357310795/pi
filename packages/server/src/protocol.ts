@@ -35,7 +35,9 @@ type _ProtocolModelInputsFitAi = Assert<ProtocolModelInput extends AiModelInput 
  * model sampling defaults, pricing tiers, and deferred-tool availability remain intentionally
  * server-side.
  */
-type _AiTextContentFieldsAccountedFor = Assert<ExactKeys<AiTextContent, "type" | "text" | "textSignature">>;
+type _AiTextContentFieldsAccountedFor = Assert<
+	ExactKeys<AiTextContent, "type" | "text" | "textSignature" | "citations">
+>;
 type _AiThinkingContentFieldsAccountedFor = Assert<
 	ExactKeys<
 		Extract<AssistantMessage["content"][number], { type: "thinking" }>,
@@ -272,6 +274,8 @@ function toProtocolAssistantContent(message: AssistantMessage): AssistantTranscr
 					toolName: identifier(part.name, "Tool call name"),
 					input: toProtocolJsonValue(part.arguments),
 				};
+			case "serverToolUse":
+				return part as any;
 			default: {
 				const exhaustive: never = part;
 				return exhaustive;
