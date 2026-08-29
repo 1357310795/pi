@@ -2,6 +2,7 @@ import type OpenAI from "openai";
 import type {
 	Tool as OpenAITool,
 	ResponseCreateParamsStreaming,
+	ResponseFunctionWebSearch,
 	ResponseInput,
 	ResponseInputContent,
 	ResponseInputImage,
@@ -9,6 +10,7 @@ import type {
 	ResponseInputText,
 	ResponseOutputItem,
 	ResponseOutputMessage,
+	ResponseOutputText,
 	ResponseReasoningItem,
 	ResponseStreamEvent,
 	ResponseToolSearchOutputItemParam,
@@ -17,9 +19,12 @@ import { calculateCost } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
+	Citation,
 	Context,
 	ImageContent,
 	Model,
+	NativeWebSearchOptions,
+	ServerToolUseContent,
 	StopReason,
 	TextContent,
 	TextSignatureV1,
@@ -27,6 +32,7 @@ import type {
 	Tool,
 	ToolCall,
 	Usage,
+	WebSearchResultRef,
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
@@ -129,8 +135,8 @@ export interface ConvertResponsesToolsOptions {
 	supportsStrictMode?: boolean;
 	supportsOpenAIGrammarTools?: boolean;
 	deferLoading?: boolean;
+	nativeWebSearch?: boolean | NativeWebSearchOptions;
 }
-
 // =============================================================================
 // Message conversion
 // =============================================================================
@@ -356,15 +362,62 @@ export function convertResponsesMessages<TApi extends Api>(
 // Tool conversion
 // =============================================================================
 
+function normalizeNativeWebSearch(
+	webSearch: boolean | NativeWebSearchOptions | undefined,
+): NativeWebSearchOptions | undefined {
+	if (!webSearch) return undefined;
+	if (webSearch === true) return {};
+	return webSearch;
+}
+
+function convertOpenAIWebSearchTool(webSearch: boolean | NativeWebSearchOptions | undefined): OpenAITool | undefined {
+	const config = normalizeNativeWebSearch(webSearch);
+	if (!config) return undefined;
+
+	if (config.allowedDomains?.length && config.blockedDomains?.length) {
+		throw new Error("OpenAI web search supports allowedDomains or blockedDomains, not both.");
+	}
+	if (config.blockedDomains?.length) {
+		throw new Error("OpenAI web search does not support blockedDomains. Use allowedDomains instead.");
+	}
+
+	const tool: OpenAITool = {
+		type: "web_search",
+	};
+
+	if (config.allowedDomains?.length) {
+		tool.filters = {
+			allowed_domains: config.allowedDomains,
+		};
+	}
+
+	if (config.searchContextSize) {
+		tool.search_context_size = config.searchContextSize;
+	}
+
+	if (config.userLocation) {
+		tool.user_location = {
+			type: config.userLocation.type ?? "approximate",
+			city: config.userLocation.city,
+			country: config.userLocation.country,
+			region: config.userLocation.region,
+			timezone: config.userLocation.timezone,
+		};
+	}
+
+	return tool;
+}
+
 export function convertResponsesTools(tools: readonly Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
 	const defaultStrict = options?.strict === undefined ? false : options.strict;
 	const supportsStrictMode = options?.supportsStrictMode ?? true;
 	const supportsOpenAIGrammarTools = options?.supportsOpenAIGrammarTools ?? false;
+	const output: OpenAITool[] = [];
 
-	return tools.map((tool) => {
+	for (const tool of tools ?? []) {
 		const grammar = resolveGrammarConstrainedSampling(tool, supportsOpenAIGrammarTools);
 		if (grammar) {
-			return {
+			output.push({
 				type: "custom",
 				name: tool.name,
 				description: tool.description,
@@ -374,7 +427,7 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 					definition: grammar.definition,
 				},
 				...(options?.deferLoading ? { defer_loading: true } : {}),
-			} satisfies OpenAITool;
+			} satisfies OpenAITool);
 		}
 
 		const constrainedStrict = resolveJsonSchemaStrictSampling(tool, supportsStrictMode);
@@ -391,14 +444,29 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 		if (supportsStrictMode) {
 			functionTool.strict = strict;
 		}
-		return functionTool as OpenAITool;
-	});
+		output.push(functionTool as OpenAITool);
+	}
+
+	const webSearchTool = convertOpenAIWebSearchTool(options?.nativeWebSearch);
+	if (webSearchTool) {
+		output.push(webSearchTool);
+	}
+
+	return output;
 }
 
 // =============================================================================
 // Stream processing
 // =============================================================================
 
+type ResponseOutputTextAnnotation = ResponseOutputText["annotations"][number];
+
+function normalizeWebSearchStatus(status: ResponseFunctionWebSearch["status"]): ServerToolUseContent["status"] {
+	if (status === "in_progress") return "in_progress";
+	if (status === "searching") return "searching";
+	if (status === "completed") return "completed";
+	return "error";
+}
 type StreamingToolCall = ToolCall & {
 	partialJson?: string;
 	customInput?: {
@@ -425,7 +493,8 @@ function appendCustomToolCallInput(block: StreamingToolCall, nextInput: string, 
 type ResponsesOutputSlot =
 	| { type: "thinking"; block: ThinkingContent; contentIndex: number }
 	| { type: "text"; block: TextContent; contentIndex: number }
-	| { type: "toolCall"; block: StreamingToolCall; contentIndex: number };
+	| { type: "toolCall"; block: StreamingToolCall; contentIndex: number }
+	| { type: "serverToolUse"; block: ServerToolUseContent; contentIndex: number };
 
 type ToolCallOutputSlot = Extract<ResponsesOutputSlot, { type: "toolCall" }>;
 
@@ -524,6 +593,22 @@ export async function processResponsesStream<TApi extends Api>(
 			outputSlots.set(outputIndex, slot);
 			stream.push({ type: "toolcall_start", contentIndex: slot.contentIndex, partial: output });
 			return slot;
+		}
+		if (item.type === "web_search_call") {
+			const block: ServerToolUseContent = {
+				type: "serverToolUse",
+				id: item.id,
+				name: "web_search",
+				status: normalizeWebSearchStatus(item.status),
+			};
+			output.content.push(block);
+			const slot = {
+				type: "serverToolUse",
+				block,
+				contentIndex: output.content.length - 1,
+			} satisfies ResponsesOutputSlot;
+			outputSlots.set(outputIndex, slot);
+			stream.push({ type: "server_tool_use_start", contentIndex: slot.contentIndex, partial: output });
 		}
 		return undefined;
 	};
@@ -698,6 +783,31 @@ export async function processResponsesStream<TApi extends Api>(
 			} else if (item.type === "message" && slot?.type === "text") {
 				slot.block.text = item.content?.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("") || "";
 				slot.block.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
+				// Fold any url_citation annotations attached to the final message into the
+				// text block, deduplicating against citations that arrived via streaming
+				// `output_text.annotation.added` events.
+				for (const part of item.content) {
+					if (part.type !== "output_text" || !part.annotations) continue;
+					for (const annotation of part.annotations as ResponseOutputTextAnnotation[]) {
+						if (annotation.type !== "url_citation") continue;
+						if (!slot.block.citations) slot.block.citations = [];
+						const dedup = slot.block.citations;
+						const alreadyPresent = dedup.some(
+							(c) =>
+								c.url === annotation.url &&
+								c.startIndex === annotation.start_index &&
+								c.endIndex === annotation.end_index,
+						);
+						if (!alreadyPresent) {
+							dedup.push({
+								url: annotation.url,
+								title: annotation.title,
+								startIndex: annotation.start_index,
+								endIndex: annotation.end_index,
+							});
+						}
+					}
+				}
 				stream.push({
 					type: "text_end",
 					contentIndex: slot.contentIndex,
@@ -736,6 +846,43 @@ export async function processResponsesStream<TApi extends Api>(
 					partial: output,
 				});
 				outputSlots.delete(event.output_index);
+			} else if (item.type === "web_search_call") {
+				const slot = getSlot(event.output_index, "serverToolUse");
+				if (!slot) continue;
+				const block = slot.block;
+				if (block?.type === "serverToolUse") {
+					block.status = normalizeWebSearchStatus(item.status);
+					const action = item.action;
+					if (action?.type === "search") {
+						const queries =
+							action.queries && action.queries.length > 0
+								? action.queries
+								: action.query
+									? [action.query]
+									: undefined;
+						block.queries = queries;
+						block.action = {
+							type: "search",
+							query: action.query,
+							queries: action.queries,
+							sources: action.sources?.map((s) => ({ url: s.url })),
+						};
+						if (action.sources && action.sources.length > 0) {
+							block.results = action.sources.map((s): WebSearchResultRef => ({ url: s.url, title: "" }));
+						}
+					} else if (action?.type === "open_page") {
+						block.action = { type: "open_page", url: action.url ?? "" };
+					} else if (action?.type === "find_in_page") {
+						block.action = { type: "find_in_page", url: action.url, pattern: action.pattern };
+					}
+					block.signature = JSON.stringify(item);
+					stream.push({
+						type: "server_tool_use_end",
+						contentIndex: slot.contentIndex,
+						serverToolUse: block,
+						partial: output,
+					});
+				}
 			}
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
@@ -752,6 +899,50 @@ export async function processResponsesStream<TApi extends Api>(
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
 			throw new Error(msg);
+		} else if (
+			event.type === "response.web_search_call.in_progress" ||
+			event.type === "response.web_search_call.searching" ||
+			event.type === "response.web_search_call.completed"
+		) {
+			const slot = getSlot(event.output_index, "serverToolUse");
+			if (!slot) continue;
+			const block = slot.block;
+			if (block?.type === "serverToolUse") {
+				if (event.type === "response.web_search_call.in_progress") {
+					block.status = "in_progress";
+				} else if (event.type === "response.web_search_call.searching") {
+					block.status = "searching";
+				} else {
+					block.status = "completed";
+				}
+				stream.push({ type: "server_tool_use_delta", contentIndex: slot.contentIndex, partial: output });
+			}
+		} else if (event.type === "response.output_text.annotation.added") {
+			const annotation = event.annotation as ResponseOutputTextAnnotation | undefined;
+			if (annotation?.type === "url_citation") {
+				const slot = getSlot(event.output_index, "text");
+				if (!slot) continue;
+				const block = slot.block;
+				if (block?.type === "text") {
+					const citation: Citation = {
+						url: annotation.url,
+						title: annotation.title,
+						startIndex: annotation.start_index,
+						endIndex: annotation.end_index,
+					};
+					block.citations = block.citations || [];
+					block.citations.push(citation);
+					// Mirror onto the in-flight currentItem so output_item.done sees it later.
+					// if (currentItem?.type === "message" && currentItem.id === event.item_id) {
+					// 	const part = currentItem.content?.[event.content_index];
+					// 	if (part?.type === "output_text") {
+					// 		part.annotations = part.annotations || [];
+					// 		part.annotations.push(annotation);
+					// 	}
+					// }
+					stream.push({ type: "citation_added", contentIndex: slot.contentIndex, citation, partial: output });
+				}
+			}
 		}
 	}
 	if (!sawTerminalResponseEvent) {

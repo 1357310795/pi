@@ -827,12 +827,14 @@ function toChatMessages(messages: Message[], supportsImages: boolean): MistralCh
 					}
 					continue;
 				}
-				toolCalls.push({
-					id: block.id,
-					type: "function",
-					function: { name: block.name, arguments: JSON.stringify(block.arguments || {}) },
-					index: 0,
-				});
+				if (block.type === "toolCall") {
+					toolCalls.push({
+						id: block.id,
+						type: "function",
+						function: { name: block.name, arguments: JSON.stringify(block.arguments || {}) },
+						index: 0,
+					});
+				}
 			}
 
 			const assistantMessage: MistralChatMessage = { role: "assistant", prefix: false };
